@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# Open one tmux window and one Claude Code worktree for each selected GitHub issue.
+# Compatible with Bash 3.2+ (including the Bash shipped with macOS).
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+LIMIT=100
+ATTACH=false
+DRY_RUN=false
+SESSION=""
+LABELS=()
+REQUESTED_ISSUES=()
+ISSUE_NUMBERS=()
+ISSUE_TITLES=()
+ISSUE_URLS=()
+
+usage() {
+  cat <<USAGE
+Usage:
+  $SCRIPT_NAME [options] <tmux-session> --label <label>
+  $SCRIPT_NAME [options] <tmux-session> <issue-number> [issue-number ...]
+  $SCRIPT_NAME [options] <tmux-session> --label <label> <issue-number> ...
+
+Selection:
+  -l, --label LABEL    Select open issues carrying LABEL. Repeat to require
+                       multiple labels (GitHub applies repeated labels as AND).
+  ISSUE_NUMBER         Select an explicit issue, for example 42 or #42.
+
+Options:
+  -L, --limit NUMBER   Maximum issues returned by the label query (default: 100).
+      --attach         Attach/switch to the target tmux session after launching.
+      --dry-run        Show what would be launched without changing tmux.
+  -h, --help           Show this help.
+
+Run this command from inside the local Git checkout corresponding to the
+GitHub repository.
+
+Examples:
+  $SCRIPT_NAME security-fixes --label security
+  $SCRIPT_NAME sprint-42 125 131 144
+  $SCRIPT_NAME security-fixes --label security --limit 50 --attach
+USAGE
+}
+
+log() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'Warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_value() {
+  [ "$#" -ge 2 ] && [ -n "$2" ] || die "Option $1 requires a value."
+}
+
+command_path() {
+  command -v "$1" 2>/dev/null || die "Required command not found: $1"
+}
+
+slugify() {
+  local value slug
+  value="$1"
+  slug="$({
+    printf '%s' "$value" \
+      | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+      | cut -c1-48 \
+      | sed -E 's/-+$//'
+  } || true)"
+
+  [ -n "$slug" ] || slug="issue"
+  printf '%s' "$slug"
+}
+
+issue_is_already_selected() {
+  local wanted existing
+  wanted="$1"
+  for existing in "${ISSUE_NUMBERS[@]}"; do
+    [ "$existing" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
+add_issue() {
+  local number title url
+  number="$1"
+  title="$2"
+  url="$3"
+
+  if issue_is_already_selected "$number"; then
+    return 0
+  fi
+
+  ISSUE_NUMBERS+=("$number")
+  ISSUE_TITLES+=("$title")
+  ISSUE_URLS+=("$url")
+}
+
+window_exists_for_issue() {
+  local number
+  number="$1"
+  "$TMUX_BIN" list-windows -t "=${SESSION}" -F '#{window_name}' 2>/dev/null \
+    | grep -Eq "^i${number}(-|$)"
+}
+
+build_prompt() {
+  local number title url worktree_name
+  number="$1"
+  title="$2"
+  url="$3"
+  worktree_name="$4"
+
+  cat <<PROMPT
+Implement GitHub issue #${number}: ${title}
+Issue URL: ${url}
+
+You are running in a dedicated Claude Code worktree named:
+${worktree_name}
+
+Start with investigation and planning only:
+1. Read the complete GitHub issue, including comments and linked context. Use:
+   gh issue view ${number} --comments
+2. Inspect the relevant code, tests, architecture, and repository instructions.
+3. Restate the intended behavior and derive explicit acceptance criteria.
+4. Identify affected components, compatibility concerns, security implications,
+   edge cases, required tests, and documentation changes.
+5. Produce a detailed, ordered implementation plan. Mention specific files or
+   modules where reasonably identifiable.
+6. Call out assumptions, unresolved questions, and any scope that should not be
+   included.
+
+Do not edit files, create commits, or begin implementation until I explicitly
+approve the plan. Ask focused questions when a material requirement is unclear.
+
+After approval:
+- Implement only the approved scope in the current worktree.
+- Follow the repository's existing conventions and CLAUDE.md instructions.
+- Add or update tests and run the relevant validation commands.
+- Review the final diff for correctness, security, and unnecessary changes.
+- Do not merge into the main branch.
+- Finish with a concise summary of changes, tests run, remaining risks, and the
+  suggested next step (for example commit, push, or pull request).
+PROMPT
+}
+
+launch_issue() {
+  local number title url slug worktree_name window_slug window_name prompt
+  local prompt_file prompt_file_q claude_q command created_session
+
+  number="$1"
+  title="$2"
+  url="$3"
+  slug="$(slugify "$title")"
+  worktree_name="${number}-${slug}"
+  window_slug="$(printf '%s' "$slug" | cut -c1-28 | sed -E 's/-+$//')"
+  window_name="i${number}-${window_slug}"
+  prompt="$(build_prompt "$number" "$title" "$url" "$worktree_name")"
+  created_session=false
+
+  if [ "$DRY_RUN" = true ]; then
+    printf 'Would launch issue #%s in session %q, window %q, worktree %q\n' \
+      "$number" "$SESSION" "$window_name" "$worktree_name"
+    return 0
+  fi
+
+  if "$TMUX_BIN" has-session -t "=${SESSION}" 2>/dev/null \
+      && window_exists_for_issue "$number"; then
+    warn "Skipping issue #${number}; a matching window already exists in session '${SESSION}'."
+    return 0
+  fi
+
+  prompt_file="$(mktemp "${TMPDIR:-/tmp}/${SCRIPT_NAME}.${number}.XXXXXX")"
+  chmod 600 "$prompt_file"
+  printf '%s\n' "$prompt" > "$prompt_file"
+
+  # Only controlled, single-line values are shell-quoted here. The multiline
+  # prompt is read from a private temporary file inside the new tmux window.
+  printf -v prompt_file_q '%q' "$prompt_file"
+  printf -v claude_q '%q' "$CLAUDE_BIN"
+  command="prompt=\$(cat ${prompt_file_q}); rm -f ${prompt_file_q}; exec ${claude_q} --worktree '${worktree_name}' --permission-mode plan \"\$prompt\""
+
+  if ! "$TMUX_BIN" has-session -t "=${SESSION}" 2>/dev/null; then
+    if "$TMUX_BIN" new-session -d -s "$SESSION" -n "$window_name" -c "$REPO_ROOT" "$command"; then
+      created_session=true
+    else
+      rm -f "$prompt_file"
+      die "Could not create tmux session '${SESSION}'."
+    fi
+  else
+    if ! "$TMUX_BIN" new-window -d -t "=${SESSION}:" -n "$window_name" -c "$REPO_ROOT" "$command"; then
+      rm -f "$prompt_file"
+      die "Could not create tmux window for issue #${number}."
+    fi
+  fi
+
+  if [ "$created_session" = true ]; then
+    log "Created session '${SESSION}': issue #${number} -> ${window_name} (${worktree_name})"
+  else
+    log "Created window: issue #${number} -> ${window_name} (${worktree_name})"
+  fi
+}
+
+# Parse arguments. The first non-option argument is the tmux session name;
+# subsequent non-option arguments are issue numbers.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -l|--label)
+      require_value "$@"
+      LABELS+=("$2")
+      shift 2
+      ;;
+    -L|--limit)
+      require_value "$@"
+      LIMIT="$2"
+      shift 2
+      ;;
+    --attach)
+      ATTACH=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [ "$#" -gt 0 ]; do
+        if [ -z "$SESSION" ]; then
+          SESSION="$1"
+        else
+          REQUESTED_ISSUES+=("$1")
+        fi
+        shift
+      done
+      ;;
+    -*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      if [ -z "$SESSION" ]; then
+        SESSION="$1"
+      else
+        REQUESTED_ISSUES+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+[ -n "$SESSION" ] || { usage >&2; die "A tmux session name is required."; }
+[ "${#LABELS[@]}" -gt 0 ] || [ "${#REQUESTED_ISSUES[@]}" -gt 0 ] \
+  || { usage >&2; die "Provide at least one --label or issue number."; }
+
+case "$LIMIT" in
+  ''|*[!0-9]*) die "--limit must be a positive integer." ;;
+  0) die "--limit must be greater than zero." ;;
+esac
+
+case "$SESSION" in
+  *:*) die "The tmux session name must not contain a colon." ;;
+esac
+
+GIT_BIN="$(command_path git)"
+GH_BIN="$(command_path gh)"
+TMUX_BIN="$(command_path tmux)"
+CLAUDE_BIN="$(command_path claude)"
+# Use the resolved paths consistently, while retaining conventional command
+# names inside helper functions where tmux is already verified in PATH.
+: "$GIT_BIN" "$GH_BIN" "$TMUX_BIN"
+
+REPO_ROOT="$($GIT_BIN rev-parse --show-toplevel 2>/dev/null)" \
+  || die "Run this script inside a Git repository."
+$GIT_BIN -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1 \
+  || die "The repository needs at least one commit before worktrees can be created."
+
+CLAUDE_HELP="$($CLAUDE_BIN --help 2>&1)" \
+  || die "Could not inspect the Claude Code CLI."
+if ! printf '%s\n' "$CLAUDE_HELP" | grep -q -- '--worktree'; then
+  die "This Claude Code version does not support --worktree. Update Claude Code first."
+fi
+if ! printf '%s\n' "$CLAUDE_HELP" | grep -q -- '--permission-mode'; then
+  die "This Claude Code version does not support --permission-mode. Update Claude Code first."
+fi
+
+cd "$REPO_ROOT"
+
+# Repeated --label flags are intentionally forwarded separately; GitHub CLI
+# treats them as an AND filter.
+if [ "${#LABELS[@]}" -gt 0 ]; then
+  gh_args=(issue list --state open --limit "$LIMIT" --json number,title,url --jq '.[] | [.number, .title, .url] | @tsv')
+  for label in "${LABELS[@]}"; do
+    gh_args+=(--label "$label")
+  done
+
+  label_output="$("$GH_BIN" "${gh_args[@]}")" \
+    || die "Could not list GitHub issues for the requested label selection."
+  while IFS=$'\t' read -r number title url; do
+    [ -n "$number" ] || continue
+    add_issue "$number" "$title" "$url"
+  done <<< "$label_output"
+fi
+
+for requested in "${REQUESTED_ISSUES[@]}"; do
+  requested="${requested#\#}"
+  case "$requested" in
+    ''|*[!0-9]*) die "Invalid issue number: $requested" ;;
+  esac
+
+  issue_line="$($GH_BIN issue view "$requested" --json number,title,url --jq '[.number, .title, .url] | @tsv')" \
+    || die "Could not read GitHub issue #${requested}."
+  IFS=$'\t' read -r number title url <<ISSUE
+$issue_line
+ISSUE
+  add_issue "$number" "$title" "$url"
+done
+
+[ "${#ISSUE_NUMBERS[@]}" -gt 0 ] \
+  || die "No open issues matched the requested label selection."
+
+log "Repository: $REPO_ROOT"
+log "Issues selected: ${#ISSUE_NUMBERS[@]}"
+
+index=0
+while [ "$index" -lt "${#ISSUE_NUMBERS[@]}" ]; do
+  launch_issue \
+    "${ISSUE_NUMBERS[$index]}" \
+    "${ISSUE_TITLES[$index]}" \
+    "${ISSUE_URLS[$index]}"
+  index=$((index + 1))
+done
+
+if [ "$DRY_RUN" = true ]; then
+  exit 0
+fi
+
+if [ "$ATTACH" = true ]; then
+  if [ -n "${TMUX:-}" ]; then
+    "$TMUX_BIN" switch-client -t "=${SESSION}"
+  else
+    "$TMUX_BIN" attach-session -t "=${SESSION}"
+  fi
+else
+  log "Open the session with: tmux attach-session -t '$SESSION'"
+fi

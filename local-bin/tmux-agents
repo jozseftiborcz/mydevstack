@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# List Claude Code agents registered by the claude-tmux-state hook and attach
+# to one by number.
+#
+# The hook writes @agent_* options at pane, window, or session scope. tmux
+# resolves user options across all three scopes in pane formats, so a single
+# list-panes call sees every agent regardless of @agent_scope. Rows are then
+# reduced to the pane that actually ran the hook (@agent_pane_id) so that
+# window/session scope does not report every sibling pane as an agent.
+
+set -euo pipefail
+
+# Tab is the only control character tmux passes through format output
+# verbatim; others (including 0x1f) come back octal-escaped, e.g. "\037".
+# The hook strips tabs from status text, so tab is unambiguous here.
+readonly DELIM=$'\t'
+
+# Field offsets within a row, in the order TMUX_FORMAT emits them.
+readonly F_PANE_ID=0
+readonly F_SESSION_ID=1
+readonly F_SESSION_NAME=2
+readonly F_WINDOW_ID=3
+readonly F_WINDOW_INDEX=4
+readonly F_WINDOW_NAME=5
+readonly F_AGENT_PANE_ID=6
+readonly F_SCOPE=7
+readonly F_STATE=8
+readonly F_KIND=9
+readonly F_TEXT=10
+readonly F_EVENT=11
+readonly F_UPDATED=12
+readonly F_CLAUDE_SESSION_ID=13
+
+# Labels for "list -l", indexed by the field offsets above.
+readonly FIELD_LABELS=(
+    "pane-id"
+    "session-id"
+    "session-name"
+    "window-id"
+    "window-index"
+    "window-name"
+    "agent-pane-id"
+    "scope"
+    "state"
+    "status-kind"
+    "status-text"
+    "event"
+    "updated"
+    "claude-session-id"
+)
+
+readonly TMUX_FORMAT="\
+#{pane_id}${DELIM}\
+#{session_id}${DELIM}\
+#{session_name}${DELIM}\
+#{window_id}${DELIM}\
+#{window_index}${DELIM}\
+#{window_name}${DELIM}\
+#{@agent_pane_id}${DELIM}\
+#{@agent_scope}${DELIM}\
+#{@agent_state}${DELIM}\
+#{@agent_status_kind}${DELIM}\
+#{@agent_status_text}${DELIM}\
+#{@agent_event}${DELIM}\
+#{@agent_updated}${DELIM}\
+#{@agent_claude_session_id}"
+
+agents=()
+fields=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  tmux-agents [list]        List agents (default).
+  tmux-agents list -l       List agents with every recorded field.
+  tmux-agents NUMBER        Attach to the agent shown with that number.
+  tmux-agents next          Attach to the first agent waiting for input.
+  tmux-agents -h            Show this help.
+
+States come from the claude-tmux-state hook:
+  INPUT       Claude is waiting for you (question, plan, or permission).
+  ERROR       Claude stopped because of an error.
+  IDLE        Turn finished or session ready.
+  BACKGROUND  Turn ended with background tasks still running.
+  RUNNING     Claude is working.
+  OFFLINE     The Claude session ended.
+
+Agents that need a human are listed first, so the lowest numbers are the
+ones worth attaching to.
+
+Examples:
+  tmux-agents
+  tmux-agents list -l
+  tmux-agents 2
+  tmux-agents next
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+command -v tmux >/dev/null 2>&1 || die "tmux is not installed."
+tmux has-session 2>/dev/null || die "No tmux server is running."
+
+# Split a row into the global "fields" array. A plain "IFS=$DELIM read" cannot
+# be used: tab is IFS whitespace, so bash would collapse runs of tabs and drop
+# empty fields, shifting every later column whenever an @agent_* option is
+# unset.
+split_row() {
+    local remainder="$1"
+
+    fields=()
+    while [[ "$remainder" == *"$DELIM"* ]]; do
+        fields+=("${remainder%%"$DELIM"*}")
+        remainder="${remainder#*"$DELIM"}"
+    done
+    fields+=("$remainder")
+}
+
+# Ordering key: panes that need a human first, then by session and window.
+state_rank() {
+    case "${1:-}" in
+        INPUT)      printf '0' ;;
+        ERROR)      printf '1' ;;
+        IDLE)       printf '2' ;;
+        BACKGROUND) printf '3' ;;
+        RUNNING)    printf '4' ;;
+        OFFLINE)    printf '6' ;;
+        *)          printf '5' ;;
+    esac
+}
+
+human_age() {
+    local updated="${1:-}" now delta
+
+    [[ "$updated" =~ ^[0-9]+$ ]] || { printf '-'; return; }
+
+    now="$(date +%s)"
+    delta=$((now - updated))
+    (( delta < 0 )) && delta=0
+
+    if (( delta < 60 )); then
+        printf '%ds' "$delta"
+    elif (( delta < 3600 )); then
+        printf '%dm' "$((delta / 60))"
+    elif (( delta < 86400 )); then
+        printf '%dh%dm' "$((delta / 3600))" "$(((delta % 3600) / 60))"
+    else
+        printf '%dd' "$((delta / 86400))"
+    fi
+}
+
+load_agents() {
+    local row
+    local -a ranked=()
+
+    agents=()
+
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        split_row "$row"
+
+        # Only panes the hook has reported on are agents.
+        [[ -n "${fields[$F_STATE]}" ]] || continue
+
+        # Under window/session scope every pane in that window or session
+        # inherits the same options; keep the pane the hook actually fired
+        # in. An unset @agent_pane_id (older hook) is tolerated.
+        [[ -z "${fields[$F_AGENT_PANE_ID]}" \
+            || "${fields[$F_AGENT_PANE_ID]}" == "${fields[$F_PANE_ID]}" ]] \
+            || continue
+
+        ranked+=("$(state_rank "${fields[$F_STATE]}")${DELIM}${row}")
+    done < <(tmux list-panes -a -F "$TMUX_FORMAT" 2>/dev/null)
+
+    (( ${#ranked[@]} > 0 )) || return 0
+
+    # Sort keys are offset by one because of the rank prefix: rank, session
+    # name, window index, pane id.
+    while IFS= read -r row; do
+        agents+=("${row#*"$DELIM"}")
+    done < <(
+        printf '%s\n' "${ranked[@]}" |
+            LC_ALL=C sort -t "$DELIM" -k1,1 -k4,4 -k6,6n -k2,2
+    )
+}
+
+status_width() {
+    local cols="${COLUMNS:-0}" width
+
+    if [[ ! "$cols" =~ ^[0-9]+$ ]] || (( cols == 0 )); then
+        cols="$(tput cols 2>/dev/null || true)"
+    fi
+    [[ "$cols" =~ ^[0-9]+$ ]] && (( cols > 0 )) || cols=120
+
+    # Everything left of the STATUS column occupies 75 characters.
+    width=$((cols - 75))
+    (( width < 20 )) && width=20
+    printf '%d' "$width"
+}
+
+list_agents() {
+    local number=1 row width
+
+    load_agents
+
+    if (( ${#agents[@]} == 0 )); then
+        echo "No Claude agents found. Is the claude-tmux-state hook installed?"
+        return 0
+    fi
+
+    width="$(status_width)"
+
+    printf '%-3s %-10s %-5s %-40s %-12s %s\n' \
+        "#" "STATE" "AGE" "SESSION:WINDOW" "KIND" "STATUS"
+
+    for row in "${agents[@]}"; do
+        split_row "$row"
+
+        printf '%-3d %-10s %-5s %-40.40s %-12.12s %-.*s\n' \
+            "$number" \
+            "${fields[$F_STATE]}" \
+            "$(human_age "${fields[$F_UPDATED]}")" \
+            "${fields[$F_SESSION_NAME]}:${fields[$F_WINDOW_NAME]}" \
+            "${fields[$F_KIND]}" \
+            "$width" \
+            "${fields[$F_TEXT]}"
+
+        ((number += 1))
+    done
+}
+
+# Long listing: every field the hook recorded, one agent per block. Numbers
+# match the short listing because both read the same ordered "agents" array.
+list_agents_long() {
+    local number=1 row index value
+
+    load_agents
+
+    if (( ${#agents[@]} == 0 )); then
+        echo "No Claude agents found. Is the claude-tmux-state hook installed?"
+        return 0
+    fi
+
+    for row in "${agents[@]}"; do
+        split_row "$row"
+
+        (( number > 1 )) && echo
+        printf '#%d  %s  %s:%s\n' \
+            "$number" \
+            "${fields[$F_STATE]}" \
+            "${fields[$F_SESSION_NAME]}" \
+            "${fields[$F_WINDOW_NAME]}"
+
+        for index in "${!FIELD_LABELS[@]}"; do
+            value="${fields[$index]:--}"
+
+            # The raw timestamp alone is unreadable; keep both.
+            if (( index == F_UPDATED )) && [[ "$value" != "-" ]]; then
+                value="$value ($(human_age "$value") ago)"
+            fi
+
+            printf '  %-18s %s\n' "${FIELD_LABELS[$index]}" "$value"
+        done
+
+        ((number += 1))
+    done
+}
+
+goto_agent() {
+    local pane_id session_id window_id
+
+    split_row "$1"
+    pane_id="${fields[$F_PANE_ID]}"
+    session_id="${fields[$F_SESSION_ID]}"
+    window_id="${fields[$F_WINDOW_ID]}"
+
+    [[ -n "$pane_id" && -n "$window_id" && -n "$session_id" ]] \
+        || die "Could not resolve the target pane for that agent."
+
+    tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1 \
+        || die "Agent pane $pane_id no longer exists; run 'tmux-agents' again."
+
+    # Select the window and pane first so the client lands on the agent
+    # itself rather than on whatever was last active in that session.
+    tmux select-window -t "$window_id"
+    tmux select-pane -t "$pane_id"
+
+    if [[ -n "${TMUX:-}" ]]; then
+        exec tmux switch-client -t "$session_id"
+    else
+        exec tmux attach-session -t "$session_id"
+    fi
+}
+
+attach_agent() {
+    local number="$1"
+
+    [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'Invalid agent number: %s\n\n' "$number" >&2
+        usage >&2
+        exit 2
+    }
+
+    load_agents
+
+    # This bounds check must stay outside a command substitution: an "exit"
+    # in a subshell would only end the subshell and let an empty target
+    # reach tmux.
+    if (( ${#agents[@]} == 0 || number > ${#agents[@]} )); then
+        printf 'Agent number %s does not exist.\n\n' "$number" >&2
+        list_agents >&2
+        exit 1
+    fi
+
+    goto_agent "${agents[$((number - 1))]}"
+}
+
+attach_next_waiting() {
+    local row
+
+    load_agents
+
+    for row in "${agents[@]}"; do
+        split_row "$row"
+        [[ "${fields[$F_STATE]}" == "INPUT" ]] && goto_agent "$row"
+    done
+
+    echo "No agent is waiting for input." >&2
+    exit 1
+}
+
+main() {
+    case "${1:-list}" in
+        list)
+            case "${2:-}" in
+                "")        list_agents ;;
+                -l|--long) list_agents_long ;;
+                *)         usage >&2; exit 2 ;;
+            esac
+            ;;
+        -l|--long)      list_agents_long ;;
+        next)           attach_next_waiting ;;
+        -h|--help|help) usage ;;
+        *)              attach_agent "$1" ;;
+    esac
+}
+
+# Only "list" takes a second argument.
+(( $# <= 1 )) || [[ $# -eq 2 && "$1" == "list" ]] || { usage >&2; exit 2; }
+main "$@"

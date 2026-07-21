@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+
+# Claude Code hook -> tmux status metadata
+# Dependencies: tmux, jq
+# Valid scopes: pane, window, session
+
+set -uo pipefail
+
+MAX_LEN="${CLAUDE_TMUX_STATUS_MAX_LENGTH:-180}"
+SHOW_PROMPT="${CLAUDE_TMUX_SHOW_PROMPT:-0}"
+SHOW_COMMANDS="${CLAUDE_TMUX_SHOW_COMMANDS:-0}"
+DEBUG_LOG="${CLAUDE_TMUX_DEBUG_LOG:-}"
+
+payload="$(cat)" || exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+jq -e . >/dev/null 2>&1 <<<"$payload" || exit 0
+
+pane_id="${TMUX_PANE:-}"
+[[ -n "$pane_id" ]] || exit 0
+
+# This hook fires on every tool call, so it resolves the pane's identity with a
+# single display-message rather than one per field. Tab is the only control
+# character tmux passes through format output verbatim, and none of these
+# fields can contain one.
+DELIM=$'\t'
+
+# A plain "IFS=$DELIM read" cannot be used to split the result: tab is IFS
+# whitespace, so bash would collapse runs of tabs and drop empty fields,
+# shifting every later value whenever one is unset (same reason as split_row
+# in tmux-agents).
+split_fields() {
+    local remainder="$1"
+
+    fields=()
+    while [[ "$remainder" == *"$DELIM"* ]]; do
+        fields+=("${remainder%%"$DELIM"*}")
+        remainder="${remainder#*"$DELIM"}"
+    done
+    fields+=("$remainder")
+}
+
+pane_info="$(tmux display-message -p -t "$pane_id" \
+    "#{window_id}${DELIM}#{window_name}${DELIM}#{session_id}${DELIM}#{session_name}" \
+    2>/dev/null)" || exit 0
+
+split_fields "$pane_info"
+window_id="${fields[0]:-}"
+window_name="${fields[1]:-}"
+session_id="${fields[2]:-}"
+session_name="${fields[3]:-}"
+[[ -n "$window_id" && -n "$session_id" ]] || exit 0
+
+get_scope_option() {
+    local level="$1" target="$2"
+    case "$level" in
+        pane)    tmux show-options -pqv -t "$target" @claude_state_scope 2>/dev/null || true ;;
+        window)  tmux show-options -wqv -t "$target" @claude_state_scope 2>/dev/null || true ;;
+        session) tmux show-options -qv  -t "$target" @claude_state_scope 2>/dev/null || true ;;
+        global)  tmux show-options -gqv @claude_state_scope 2>/dev/null || true ;;
+    esac
+}
+
+scope="${CLAUDE_TMUX_SCOPE:-}"
+[[ -n "$scope" ]] || scope="$(get_scope_option pane "$pane_id")"
+[[ -n "$scope" ]] || scope="$(get_scope_option window "$window_id")"
+[[ -n "$scope" ]] || scope="$(get_scope_option session "$session_id")"
+[[ -n "$scope" ]] || scope="$(get_scope_option global '')"
+scope="${scope:-pane}"
+
+case "$scope" in
+    pane|window|session) ;;
+    *) printf 'claude-tmux-state: invalid scope: %s\n' "$scope" >&2; exit 0 ;;
+esac
+
+# Queue the option writes and flush them in one tmux invocation at the end.
+# The hook fires on every tool call, so twelve forks per fire was the dominant
+# cost. ";" has to be its own argument for tmux to read it as a command
+# separator.
+meta_args=()
+
+set_meta() {
+    local key="$1" value="${2:-}"
+
+    # tmux reads an argument of exactly ";" as a command separator, so a status
+    # text of just ";" is rejected as a missing value -- and in a batch it also
+    # drops every option queued after it. Escaping makes tmux store the literal
+    # character.
+    [[ "$value" == ';' ]] && value='\;'
+
+    (( ${#meta_args[@]} > 0 )) && meta_args+=(';')
+
+    case "$scope" in
+        pane)    meta_args+=(set-option -pq -t "$pane_id" "$key" "$value") ;;
+        window)  meta_args+=(set-option -wq -t "$window_id" "$key" "$value") ;;
+        session) meta_args+=(set-option -q  -t "$session_id" "$key" "$value") ;;
+    esac
+}
+
+flush_meta() {
+    (( ${#meta_args[@]} > 0 )) || return 0
+    tmux "${meta_args[@]}" 2>/dev/null || true
+}
+
+clean() {
+    printf '%s' "${1:-}" |
+        tr '\r\n\t' '   ' |
+        sed -E 's/[[:cntrl:]]//g; s/[[:space:]]+/ /g; s/^ //; s/ $//' |
+        cut -c1-"$MAX_LEN"
+}
+
+short_path() {
+    local path="${1:-}"
+    [[ -n "$path" ]] && basename "$path" 2>/dev/null || printf '%s' "$path"
+}
+
+question_text() {
+    jq -r '
+        (.tool_input.questions // []) as $q
+        | if ($q | length) == 0 then "Waiting for your answer"
+          else ($q[0].question // "Waiting for your answer")
+             + (if ($q | length) > 1
+                then " (+" + ((($q | length) - 1) | tostring) + " more)"
+                else "" end)
+          end
+    ' <<<"$payload"
+}
+
+answer_text() {
+    jq -r '
+        def values:
+            if type == "object" then to_entries | map(.value | tostring) | join(", ")
+            elif type == "array" then map(tostring) | join(", ")
+            elif type == "string" then .
+            else "" end;
+        (.tool_response.answers // .tool_input.answers // null) as $a
+        | if $a == null then "" else ($a | values) end
+    ' <<<"$payload" 2>/dev/null || true
+}
+
+tool_status() {
+    local tool="$1" desc path value
+    desc="$(jq -r '.tool_input.description // ""' <<<"$payload")"
+
+    case "$tool" in
+        Bash)
+            if [[ -n "$desc" ]]; then
+                printf 'Running: %s' "$desc"
+            elif [[ "$SHOW_COMMANDS" == "1" ]]; then
+                value="$(jq -r '.tool_input.command // "Bash command"' <<<"$payload")"
+                printf 'Running: %s' "$value"
+            else
+                printf 'Running Bash command'
+            fi
+            ;;
+        Read|Write|Edit)
+            path="$(jq -r '.tool_input.file_path // ""' <<<"$payload")"
+            printf '%sing %s' "$tool" "$(short_path "$path")"
+            ;;
+        Glob|Grep)
+            value="$(jq -r '.tool_input.pattern // ""' <<<"$payload")"
+            printf '%s: %s' "$tool" "${value:-searching}"
+            ;;
+        WebSearch)
+            value="$(jq -r '.tool_input.query // ""' <<<"$payload")"
+            printf 'Web search: %s' "${value:-query}"
+            ;;
+        Agent)
+            value="$(jq -r '.tool_input.description // .tool_input.subagent_type // ""' <<<"$payload")"
+            printf 'Running subagent%s' "${value:+: $value}"
+            ;;
+        *) printf 'Running %s' "$tool" ;;
+    esac
+}
+
+permission_status() {
+    local tool="$1" desc path command
+    case "$tool" in
+        AskUserQuestion) question_text ;;
+        ExitPlanMode) printf 'Plan ready for approval' ;;
+        Bash)
+            desc="$(jq -r '.tool_input.description // ""' <<<"$payload")"
+            if [[ -n "$desc" ]]; then
+                printf 'Approve: %s' "$desc"
+            elif [[ "$SHOW_COMMANDS" == "1" ]]; then
+                command="$(jq -r '.tool_input.command // "Bash command"' <<<"$payload")"
+                printf 'Approve: %s' "$command"
+            else
+                printf 'Approve Bash command'
+            fi
+            ;;
+        Edit|Write)
+            path="$(jq -r '.tool_input.file_path // ""' <<<"$payload")"
+            printf 'Approve %s: %s' "$tool" "$(short_path "$path")"
+            ;;
+        *) printf 'Approve tool use: %s' "$tool" ;;
+    esac
+}
+
+stop_status() {
+    local message marker
+    message="$(jq -r '.last_assistant_message // ""' <<<"$payload")"
+
+    marker="$(
+        printf '%s\n' "$message" |
+            grep -iE '^[[:space:]]*TMUX_STATUS[[:space:]]*:' |
+            tail -n 1 |
+            sed -E 's/^[[:space:]]*[Tt][Mm][Uu][Xx]_[Ss][Tt][Aa][Tt][Uu][Ss][[:space:]]*:[[:space:]]*//'
+    )"
+
+    if [[ -n "$marker" ]]; then
+        printf '%s' "$marker"
+        return
+    fi
+
+    jq -r '
+        (.last_assistant_message // "")
+        | gsub("\\r"; "") | split("\\n")
+        | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
+        | . as $lines
+        | ([$lines[] | select(test("\\?\\s*$"))] | last)
+          // ([$lines[] | select(test(
+                "^(suggested )?next step|^next action|^action required|^please (choose|confirm|provide)";
+                "i"
+             ))] | last)
+          // ($lines | last)
+          // "Response complete"
+    ' <<<"$payload"
+}
+
+if [[ -n "$DEBUG_LOG" ]]; then
+    mkdir -p "$(dirname "$DEBUG_LOG")" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+        "$(jq -r '.hook_event_name // ""' <<<"$payload")" \
+        "$(jq -r '.tool_name // .notification_type // ""' <<<"$payload")" \
+        "$session_name" "$pane_id" >>"$DEBUG_LOG" 2>/dev/null || true
+fi
+
+event="$(jq -r '.hook_event_name // ""' <<<"$payload")"
+state="RUNNING"
+kind="activity"
+description="Claude is working"
+
+case "$event" in
+    SessionStart)
+        state="IDLE"; kind="ready"
+        [[ "$(jq -r '.source // "startup"' <<<"$payload")" == "resume" ]] \
+            && description="Claude session resumed" \
+            || description="Claude session ready"
+        ;;
+
+    UserPromptSubmit)
+        state="RUNNING"; kind="request"
+        [[ "$SHOW_PROMPT" == "1" ]] \
+            && description="$(jq -r '.prompt // "Processing submitted request"' <<<"$payload")" \
+            || description="Processing submitted request"
+        ;;
+
+    MessageDisplay)
+        [[ "$(jq -r '.index // 0' <<<"$payload")" == "0" ]] || exit 0
+        state="RUNNING"; kind="responding"; description="Claude is responding"
+        ;;
+
+    PreToolUse)
+        tool="$(jq -r '.tool_name // "tool"' <<<"$payload")"
+        case "$tool" in
+            AskUserQuestion)
+                state="INPUT"; kind="question"; description="$(question_text)" ;;
+            ExitPlanMode)
+                state="INPUT"; kind="approval"; description="Plan ready for approval" ;;
+            *)
+                state="RUNNING"; kind="tool"; description="$(tool_status "$tool")" ;;
+        esac
+        ;;
+
+    PermissionRequest)
+        tool="$(jq -r '.tool_name // "tool"' <<<"$payload")"
+        state="INPUT"
+        case "$tool" in
+            AskUserQuestion) kind="question" ;;
+            ExitPlanMode) kind="approval" ;;
+            *) kind="permission" ;;
+        esac
+        description="$(permission_status "$tool")"
+        ;;
+
+    PostToolUse)
+        tool="$(jq -r '.tool_name // "tool"' <<<"$payload")"
+        state="RUNNING"
+        case "$tool" in
+            AskUserQuestion)
+                kind="decision-received"
+                answer="$(answer_text)"
+                [[ -n "$answer" ]] \
+                    && description="Decision received: $answer" \
+                    || description="Design decision received; Claude is continuing"
+                ;;
+            ExitPlanMode)
+                kind="plan-approved"; description="Plan decision received; Claude is continuing"
+                ;;
+            *)
+                kind="activity"; description="Completed $tool; Claude is continuing"
+                ;;
+        esac
+        ;;
+
+    PostToolUseFailure)
+        tool="$(jq -r '.tool_name // "tool"' <<<"$payload")"
+        state="RUNNING"; kind="tool-failure"
+        [[ "$(jq -r '.is_interrupt // false' <<<"$payload")" == "true" ]] \
+            && description="$tool was interrupted; Claude is continuing" \
+            || description="$tool failed; Claude is handling the result"
+        ;;
+
+    PostToolBatch)
+        state="RUNNING"; kind="activity"; description="Tool batch completed; Claude is continuing"
+        ;;
+
+    PermissionDenied)
+        tool="$(jq -r '.tool_name // "tool"' <<<"$payload")"
+        state="RUNNING"; kind="permission-denied"
+        description="$tool was denied; Claude is handling the result"
+        ;;
+
+    Elicitation)
+        state="INPUT"; kind="question"
+        description="$(jq -r '.message // "An MCP tool needs your input"' <<<"$payload")"
+        ;;
+
+    ElicitationResult)
+        state="RUNNING"; kind="input-received"
+        description="MCP input $(jq -r '.action // "submitted"' <<<"$payload"); Claude is continuing"
+        ;;
+
+    Notification)
+        notification="$(jq -r '.notification_type // ""' <<<"$payload")"
+        case "$notification" in
+            permission_prompt) exit 0 ;;
+            idle_prompt)
+                state="IDLE"; kind="idle"
+                description="$(jq -r '.message // "Claude is waiting for the next prompt"' <<<"$payload")"
+                ;;
+            elicitation_dialog|agent_needs_input)
+                state="INPUT"; kind="question"
+                description="$(jq -r '.message // .title // "Claude needs your input"' <<<"$payload")"
+                ;;
+            elicitation_complete|elicitation_response|auth_success)
+                state="RUNNING"; kind="activity"
+                description="$(jq -r '.message // .title // "Claude is continuing"' <<<"$payload")"
+                ;;
+            agent_completed)
+                state="IDLE"; kind="result"
+                description="$(jq -r '.message // .title // "Agent completed"' <<<"$payload")"
+                ;;
+            *) exit 0 ;;
+        esac
+        ;;
+
+    Stop)
+        active="$(jq -r '
+            ((.background_tasks // []) | map(select((.status // "") != "completed")) | length)
+            + ((.session_crons // []) | length)
+        ' <<<"$payload")"
+        if (( active > 0 )); then
+            state="BACKGROUND"; kind="background"
+            description="$(jq -r '
+                [(.background_tasks // [])[]
+                    | select((.status // "") != "completed")
+                    | .description // .command // .type // empty][0]
+                // "Background work is still running"
+            ' <<<"$payload")"
+        else
+            state="IDLE"; kind="result"; description="$(stop_status)"
+        fi
+        ;;
+
+    StopFailure)
+        state="ERROR"; kind="error"
+        description="$(jq -r '
+            .last_assistant_message // .error_details // .error
+            // "Claude stopped because of an API error"
+        ' <<<"$payload")"
+        ;;
+
+    SessionEnd)
+        state="OFFLINE"; kind="offline"
+        description="Claude session ended: $(jq -r '.reason // "other"' <<<"$payload")"
+        ;;
+
+    *) exit 0 ;;
+esac
+
+description="$(clean "$description")"
+
+set_meta @agent_scope "$scope"
+set_meta @agent_session_name "$session_name"
+set_meta @agent_session_id "$session_id"
+set_meta @agent_window_name "$window_name"
+set_meta @agent_window_id "$window_id"
+set_meta @agent_pane_id "$pane_id"
+set_meta @agent_claude_session_id "$(jq -r '.session_id // ""' <<<"$payload")"
+set_meta @agent_prompt_id "$(jq -r '.prompt_id // ""' <<<"$payload")"
+set_meta @agent_state "$state"
+set_meta @agent_status_kind "$kind"
+set_meta @agent_status_text "$description"
+set_meta @agent_event "$event"
+set_meta @agent_updated "$(date +%s)"
+
+flush_meta
+
+exit 0
