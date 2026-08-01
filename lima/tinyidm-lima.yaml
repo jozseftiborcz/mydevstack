@@ -1,0 +1,36 @@
+minimumLimaVersion: 2.0.0
+images:
+- location: "https://cloud.debian.org/images/cloud/trixie/20260316-2418/debian-13-genericcloud-amd64-20260316-2418.qcow2"
+  arch: "x86_64"
+  digest: "sha512:0e5edfbe49b0cca779a4a7dc9738f34c92e3ff481ee1f7d5c4e93e180654fe275eb8c96397224c6ca04a2910eaaed27489f431573ebe4cb5412ef257888b2b18"
+- location: "https://cloud.debian.org/images/cloud/trixie/20260316-2418/debian-13-genericcloud-arm64-20260316-2418.qcow2"
+  arch: "aarch64"
+  digest: "sha512:400d1651c2e6e5467736553cc67c91f06fdb6b4316d60ea45aa6a6e5dd91499048f7240628bc95c2a3d3d74bb3ed1f7e0df7d3698d1e3960e6eff2fbbee6b149"
+# Fallback to the latest release image.
+# Hint: run `limactl prune` to invalidate the cache
+
+- location: https://cloud.debian.org/images/cloud/trixie/daily/latest/debian-13-genericcloud-amd64-daily.qcow2
+  arch: x86_64
+
+- location: https://cloud.debian.org/images/cloud/trixie/daily/latest/debian-13-genericcloud-arm64-daily.qcow2
+  arch: aarch64
+
+- location: https://cloud.debian.org/images/cloud/trixie/daily/latest/debian-13-genericcloud-ppc64el-daily.qcow2
+  arch: ppc64le
+
+mountTypesUnsupported: [9p]
+mounts:
+- location: "/Users/joe/git/"
+  writable: true
+  mountPoint: "/Users/joe/git/"
+
+ssh:
+  forwardAgent: true
+
+portForwards:
+  - guestIP: "127.0.0.1"
+    guestPortRange: [1, 65535]
+    hostIP: "127.0.0.1"
+
+cpus: 4
+memory: "8GiB"

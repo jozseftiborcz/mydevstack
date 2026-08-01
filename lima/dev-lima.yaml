@@ -1,0 +1,24 @@
+minimumLimaVersion: 2.0.0
+images:
+- location: "https://cloud.debian.org/images/cloud/trixie/20260316-2418/debian-13-genericcloud-arm64-20260316-2418.qcow2"
+  arch: "aarch64"
+  digest: "sha512:400d1651c2e6e5467736553cc67c91f06fdb6b4316d60ea45aa6a6e5dd91499048f7240628bc95c2a3d3d74bb3ed1f7e0df7d3698d1e3960e6eff2fbbee6b149"
+
+mountTypesUnsupported: [9p]
+mountType: "virtiofs"
+
+mounts:
+- location: "~/vállalkozás/altescape/projektek/provitamix/drp"
+  writable: true
+- location: "~/git"
+  writable: true
+
+hostResolver:
+  enabled: false
+
+dns:
+- 1.1.1.1
+- 8.8.8.8
+
+ssh:
+  forwardAgent: true
