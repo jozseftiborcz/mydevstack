@@ -75,7 +75,12 @@ Usage:
   tmux-agents list -l       List agents with every recorded field.
   tmux-agents NUMBER        Attach to the agent shown with that number.
   tmux-agents next          Attach to the first agent waiting for input.
-  tmux-agents -h            Show this help.
+  tmux-agents new [NAME]    Create a tmux session and attach to it.
+  tmux-agents help          Show this help (also -h or --help).
+
+"new" starts the session in the current directory, naming it after that
+directory unless NAME is given. Inside tmux the client switches to the new
+session instead of nesting a second one.
 
 States come from the claude-tmux-state hook:
   INPUT       Claude is waiting for you (question, plan, or permission).
@@ -93,6 +98,7 @@ Examples:
   tmux-agents list -l
   tmux-agents 2
   tmux-agents next
+  tmux-agents new review-pr
 EOF
 }
 
@@ -102,7 +108,12 @@ die() {
 }
 
 command -v tmux >/dev/null 2>&1 || die "tmux is not installed."
-tmux has-session 2>/dev/null || die "No tmux server is running."
+
+# Only the commands that read existing panes need a live server; "new" starts
+# one itself.
+require_server() {
+    tmux has-session 2>/dev/null || die "No tmux server is running."
+}
 
 # Split a row into the global "fields" array. A plain "IFS=$DELIM read" cannot
 # be used: tab is IFS whitespace, so bash would collapse runs of tabs and drop
@@ -156,6 +167,7 @@ load_agents() {
     local row
     local -a ranked=()
 
+    require_server
     agents=()
 
     while IFS= read -r row; do
@@ -269,6 +281,49 @@ list_agents_long() {
     done
 }
 
+# Name an unnamed session after the current directory. tmux rejects ":" and
+# "." in session names because both are target separators, so they are folded
+# to "-"; a directory such as "/" that leaves nothing usable prints empty and
+# lets tmux fall back to its own numeric name.
+default_session_name() {
+    local name="${PWD##*/}"
+
+    name="${name//[:.]/-}"
+    printf '%s' "$name"
+}
+
+# Attaching from inside tmux would nest a client, so switch instead.
+attach_or_switch() {
+    if [[ -n "${TMUX:-}" ]]; then
+        exec tmux switch-client -t "$1"
+    else
+        exec tmux attach-session -t "$1"
+    fi
+}
+
+create_session() {
+    local name="${1:-}" session_id
+    local -a new_args=(new-session -d -c "$PWD")
+
+    [[ -n "$name" ]] || name="$(default_session_name)"
+
+    if [[ -n "$name" ]]; then
+        # "=" forces an exact match; without it tmux accepts a prefix and
+        # would report an unrelated session as a conflict.
+        if tmux has-session -t "=$name" 2>/dev/null; then
+            die "Session '$name' already exists; run 'tmux attach -t $name'."
+        fi
+        new_args+=(-s "$name")
+    fi
+
+    # -P -F reports the id of the session tmux actually created, which is the
+    # only usable handle when tmux chose the name itself.
+    session_id="$(tmux "${new_args[@]}" -P -F '#{session_id}')" \
+        || die "Could not create the tmux session."
+
+    attach_or_switch "$session_id"
+}
+
 goto_agent() {
     local pane_id session_id window_id
 
@@ -288,11 +343,7 @@ goto_agent() {
     tmux select-window -t "$window_id"
     tmux select-pane -t "$pane_id"
 
-    if [[ -n "${TMUX:-}" ]]; then
-        exec tmux switch-client -t "$session_id"
-    else
-        exec tmux attach-session -t "$session_id"
-    fi
+    attach_or_switch "$session_id"
 }
 
 attach_agent() {
@@ -343,11 +394,15 @@ main() {
             ;;
         -l|--long)      list_agents_long ;;
         next)           attach_next_waiting ;;
+        new)            create_session "${2:-}" ;;
         -h|--help|help) usage ;;
         *)              attach_agent "$1" ;;
     esac
 }
 
-# Only "list" takes a second argument.
-(( $# <= 1 )) || [[ $# -eq 2 && "$1" == "list" ]] || { usage >&2; exit 2; }
+# Only "list" and "new" take a second argument.
+case "${1:-list}" in
+    list|new) (( $# <= 2 )) || { usage >&2; exit 2; } ;;
+    *)        (( $# <= 1 )) || { usage >&2; exit 2; } ;;
+esac
 main "$@"
