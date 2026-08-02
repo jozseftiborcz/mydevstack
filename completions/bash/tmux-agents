@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# bash completion for tmux-agents. Works with Bash 3.2+, so the classic
+# COMPREPLY=( $(compgen ...) ) form is used rather than mapfile.
+#
+# Installed as ~/.local/share/bash-completion/completions/tmux-agents by
+# "make install"; it can also simply be sourced from ~/.bashrc.
+
+# Agent numbers, read back from the listing the command itself prints. Only
+# rows starting with a number are agents: the first line is the header and an
+# empty listing prints a notice instead.
+_tmux_agents_numbers() {
+    local cmd="$1"
+
+    command -v "$cmd" >/dev/null 2>&1 || return 0
+    "$cmd" list 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $1 }'
+}
+
+# Same folding as the script's default_session_name: tmux rejects ":" and "."
+# in session names.
+_tmux_agents_default_session() {
+    local name="${PWD##*/}"
+
+    printf '%s' "${name//[:.]/-}"
+}
+
+_tmux_agents() {
+    local cur prev candidates
+
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD - 1]}"
+    COMPREPLY=()
+
+    case "$COMP_CWORD" in
+        1)
+            candidates="list next new help -h --help -l --long"
+            # Attaching by number is the common case, so offer the live
+            # numbers alongside the subcommands.
+            candidates="$candidates $(_tmux_agents_numbers "${COMP_WORDS[0]}")"
+            COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
+            ;;
+        2)
+            case "$prev" in
+                list)
+                    COMPREPLY=( $(compgen -W "-l --long" -- "$cur") )
+                    ;;
+                new)
+                    # The directory name may contain spaces, so keep it as one
+                    # candidate and quote it for readline.
+                    local IFS=$'\n' name
+                    name="$(_tmux_agents_default_session)"
+                    COMPREPLY=( $(compgen -W "$name" -- "${cur//\\/}") )
+                    [[ -n "${COMPREPLY[0]:-}" ]] \
+                        && COMPREPLY[0]="$(printf '%q' "${COMPREPLY[0]}")"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+complete -F _tmux_agents tmux-agents

@@ -1,0 +1,74 @@
+#compdef tmux-agents
+# zsh completion for tmux-agents.
+#
+# Installed as ~/.local/share/zsh/site-functions/_tmux-agents by
+# "make install"; that directory has to be in $fpath before compinit runs.
+
+# Agent numbers, read back from the listing the command itself prints, with
+# the rest of the row kept as the description. Only rows starting with a
+# number are agents: the first line is the header and an empty listing prints
+# a notice instead.
+_tmux-agents_numbers() {
+    local -a agents
+
+    agents=(${(f)"$(_call_program agents ${(q)words[1]} list 2>/dev/null |
+        awk 'NR > 1 && $1 ~ /^[0-9]+$/ {
+                 number = $1
+                 $1 = ""
+                 sub(/^ +/, "")
+                 print number ":" $0
+             }')"})
+
+    (( $#agents )) || return 1
+    _describe -t agents 'agent' agents
+}
+
+_tmux-agents() {
+    local name
+    local -a commands options long_options
+
+    commands=(
+        'list:list agents (default)'
+        'next:attach to the first agent waiting for input'
+        'new:create a tmux session and attach to it'
+        'help:show usage'
+    )
+    long_options=(
+        '-l:list agents with every recorded field'
+        '--long:list agents with every recorded field'
+    )
+    options=(
+        $long_options
+        '-h:show usage'
+        '--help:show usage'
+    )
+
+    if (( CURRENT == 2 )); then
+        if [[ ${words[CURRENT]} == -* ]]; then
+            _describe -t options 'option' options
+        else
+            _describe -t commands 'command' commands
+            _tmux-agents_numbers
+        fi
+        return
+    fi
+
+    # Only "list" and "new" take a second argument.
+    if (( CURRENT == 3 )); then
+        case ${words[2]} in
+            list)
+                _describe -t options 'option' long_options
+                ;;
+            new)
+                # tmux rejects ":" and "." in session names, so the script
+                # folds them before falling back to the directory name.
+                name=${PWD:t}
+                name=${name//:/-}
+                name=${name//./-}
+                [[ -n $name ]] && _wanted names expl 'session name' compadd -- $name
+                ;;
+        esac
+    fi
+}
+
+_tmux-agents "$@"
