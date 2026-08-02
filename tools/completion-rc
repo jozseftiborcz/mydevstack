@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Add or remove the block that loads the installed completions in the user's
+# bash and zsh rc files.
+#
+# The block is delimited by markers so that it can be rewritten in place when
+# the completion set changes and removed again by "make uninstall". Nothing is
+# added without confirmation: without --yes the user is asked per rc file, and
+# when there is no terminal to ask on, the lines are printed instead.
+#
+#   tools/completion-rc install   --bash-dir DIR --zsh-dir DIR [--yes]
+#   tools/completion-rc uninstall [--yes]
+#
+# BASHRC and ZSHRC override the rc files, which is what the tests use.
+
+set -euo pipefail
+
+readonly BEGIN_MARKER='# >>> mydevstack completions >>>'
+readonly END_MARKER='# <<< mydevstack completions <<<'
+
+MODE=""
+BASH_DIR=""
+ZSH_DIR=""
+ASSUME_YES=false
+
+BASHRC="${BASHRC:-$HOME/.bashrc}"
+ZSHRC="${ZSHRC:-${ZDOTDIR:-$HOME}/.zshrc}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  completion-rc install --bash-dir DIR --zsh-dir DIR [--yes]
+  completion-rc uninstall [--yes]
+
+  --bash-dir DIR  Directory the bash completions were installed in.
+  --zsh-dir DIR   Directory the zsh completions were installed in.
+  --yes           Do not ask; write the change straight away.
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        install|uninstall) MODE="$1"; shift ;;
+        --bash-dir)        BASH_DIR="${2:-}"; shift 2 ;;
+        --zsh-dir)         ZSH_DIR="${2:-}"; shift 2 ;;
+        --yes|-y)          ASSUME_YES=true; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        *)                 usage >&2; die "Unknown argument: $1" ;;
+    esac
+done
+
+[ -n "$MODE" ] || { usage >&2; die "install or uninstall is required."; }
+
+# Command names, taken from what was actually installed. bash names its
+# completion files after the command, zsh prefixes them with an underscore.
+completion_names() {
+    local dir="$1" prefix="${2:-}" path name
+    local -a names=()
+
+    [ -d "$dir" ] || return 0
+    for path in "$dir"/"$prefix"*; do
+        [ -f "$path" ] || continue
+        name="$(basename "$path")"
+        names+=("${name#$prefix}")
+    done
+
+    (( ${#names[@]} > 0 )) || return 0
+    printf '%s\n' "${names[@]}"
+}
+
+bash_block() {
+    local dir="$1" name
+    local -a names=()
+
+    while IFS= read -r name; do
+        names+=("$name")
+    done < <(completion_names "$dir")
+
+    (( ${#names[@]} > 0 )) || return 0
+
+    printf '%s\n' "$BEGIN_MARKER"
+    echo '# Load the completions installed from mydevstack. Only these files are'
+    echo '# sourced, so any other completion in the directory still loads on demand.'
+    printf '_mydevstack_completions="%s"\n' "$dir"
+    printf 'for _mydevstack_name in'
+    printf ' %s' "${names[@]}"
+    printf '; do\n'
+    echo '    if [ -r "$_mydevstack_completions/$_mydevstack_name" ]; then'
+    echo '        . "$_mydevstack_completions/$_mydevstack_name"'
+    echo '    fi'
+    echo 'done'
+    echo 'unset _mydevstack_completions _mydevstack_name'
+    printf '%s\n' "$END_MARKER"
+}
+
+zsh_block() {
+    local dir="$1" name
+    local -a names=()
+
+    while IFS= read -r name; do
+        names+=("$name")
+    done < <(completion_names "$dir" _)
+
+    (( ${#names[@]} > 0 )) || return 0
+
+    printf '%s\n' "$BEGIN_MARKER"
+    printf 'fpath=("%s" $fpath)\n' "$dir"
+    echo 'if (( $+functions[compdef] )); then'
+    echo '    # compinit has already run, so registering the functions here is'
+    echo '    # what makes them visible without running compinit a second time.'
+    printf '    autoload -Uz'
+    printf ' _%s' "${names[@]}"
+    printf '\n'
+    for name in "${names[@]}"; do
+        printf '    compdef _%s %s\n' "$name" "$name"
+    done
+    echo 'else'
+    echo '    autoload -Uz compinit && compinit'
+    echo 'fi'
+    printf '%s\n' "$END_MARKER"
+}
+
+has_block() {
+    [ -f "$1" ] && grep -qF "$BEGIN_MARKER" "$1"
+}
+
+read_block() {
+    awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+        $0 == b { inside = 1 }
+        inside  { print }
+        inside && $0 == e { inside = 0 }
+    ' "$1"
+}
+
+# Everything except the block, with the blank line that precedes it dropped so
+# that repeated updates do not accumulate empty lines.
+without_block() {
+    awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+        $0 == b { skipping = 1; if (blank) blank = 0; next }
+        skipping { if ($0 == e) skipping = 0; next }
+        { if (blank) print ""; blank = 0 }
+        /^[[:space:]]*$/ { blank = 1; next }
+        { print }
+        END { if (blank) print "" }
+    ' "$1"
+}
+
+# Asks when there is a terminal to ask on. Without one the caller's default
+# decides: an install keeps its hands off the rc file, while an uninstall
+# removes the block anyway, because leaving it behind would point both shells
+# at files that are gone.
+confirm() {
+    local prompt="$1" default="$2" reply
+
+    [ "$ASSUME_YES" = true ] && return 0
+
+    if [ ! -t 0 ]; then
+        if [ "$default" = yes ]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    printf '%s [y/N] ' "$prompt"
+    read -r reply || return 1
+    case "$reply" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+    esac
+    return 1
+}
+
+# The rc file is the user's; keep the previous version next to it rather than
+# relying on them having it in version control.
+backup() {
+    [ -f "$1" ] || return 0
+    cp "$1" "$1.bak"
+    printf '  Previous version saved as %s.bak\n' "$1"
+}
+
+write_block() {
+    local rc="$1" block="$2" tmp
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/completion-rc.XXXXXX")"
+    if [ -f "$rc" ]; then
+        without_block "$rc" > "$tmp"
+        [ -s "$tmp" ] && printf '\n' >> "$tmp"
+    fi
+    printf '%s\n' "$block" >> "$tmp"
+
+    backup "$rc"
+    cat "$tmp" > "$rc"
+    rm -f "$tmp"
+    printf '  Updated %s\n' "$rc"
+}
+
+remove_block() {
+    local rc="$1" tmp
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/completion-rc.XXXXXX")"
+    without_block "$rc" > "$tmp"
+    backup "$rc"
+    cat "$tmp" > "$rc"
+    rm -f "$tmp"
+    printf '  Removed the completion block from %s\n' "$rc"
+}
+
+# macOS Terminal starts login shells, which read ~/.bash_profile and not
+# ~/.bashrc, so a block in ~/.bashrc alone can stay silently unused.
+warn_bash_profile() {
+    local profile="$HOME/.bash_profile"
+
+    [ "$BASHRC" = "$HOME/.bashrc" ] || return 0
+    [ -f "$profile" ] || return 0
+    grep -q '\.bashrc' "$profile" && return 0
+
+    echo "  Note: $profile does not source ~/.bashrc, so login shells will not"
+    echo "  pick this up. Add this to $profile:"
+    echo '    [ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
+}
+
+setup_shell() {
+    local shell="$1" rc="$2" dir="$3" block="$4"
+
+    if [ -z "$block" ]; then
+        return 0
+    fi
+
+    # Nothing to configure for a shell that is neither installed nor already
+    # set up on this machine.
+    if ! command -v "$shell" >/dev/null 2>&1 && [ ! -f "$rc" ]; then
+        return 0
+    fi
+
+    if has_block "$rc" && [ "$(read_block "$rc")" = "$block" ]; then
+        printf '%s: %s already loads the completions in %s\n' \
+            "$shell" "$rc" "$dir"
+        return 0
+    fi
+
+    echo
+    if has_block "$rc"; then
+        printf '%s: the completion block in %s is out of date.\n' "$shell" "$rc"
+    else
+        printf '%s completions are installed in %s.\n' "$shell" "$dir"
+        printf 'They are only loaded once %s sets them up.\n' "$rc"
+    fi
+
+    if confirm "Update $rc?" no; then
+        write_block "$rc" "$block"
+        if [ "$shell" = bash ]; then
+            warn_bash_profile
+        fi
+    else
+        echo "Not changed. Add this to $rc yourself to enable them:"
+        printf '%s\n' "$block" | sed 's/^/  /'
+    fi
+}
+
+teardown_shell() {
+    local shell="$1" rc="$2"
+
+    has_block "$rc" || return 0
+
+    if confirm "Remove the completion block from $rc?" yes; then
+        remove_block "$rc"
+    else
+        printf 'Left the completion block in %s in place.\n' "$rc"
+    fi
+}
+
+case "$MODE" in
+    install)
+        [ -n "$BASH_DIR" ] && [ -n "$ZSH_DIR" ] \
+            || die "--bash-dir and --zsh-dir are required for install."
+        setup_shell bash "$BASHRC" "$BASH_DIR" "$(bash_block "$BASH_DIR")"
+        setup_shell zsh "$ZSHRC" "$ZSH_DIR" "$(zsh_block "$ZSH_DIR")"
+        ;;
+    uninstall)
+        teardown_shell bash "$BASHRC"
+        teardown_shell zsh "$ZSHRC"
+        ;;
+esac

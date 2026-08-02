@@ -1,0 +1,66 @@
+#compdef implement-github-issues
+# zsh completion for implement-github-issues.
+#
+# Installed as ~/.local/share/zsh/site-functions/_implement-github-issues by
+# "make install"; that directory has to be in $fpath before compinit runs.
+#
+# _call_program joins its arguments and evaluates the result, so every command
+# below is built as an array and passed through ${(q)...}: unquoted, "#{...}"
+# would start a comment and a jq filter's "|" would become a pipe.
+
+# Labels and issues can only be queried from inside the checkout the command
+# itself expects to be run in.
+_implement-github-issues_in_repo() {
+    (( $+commands[gh] )) || return 1
+    command git rev-parse --git-dir >/dev/null 2>&1
+}
+
+_implement-github-issues_labels() {
+    local -a labels cmd
+
+    _implement-github-issues_in_repo || return 1
+    cmd=(gh label list --limit 100 --json name,description
+         --jq '.[] | "\(.name):\(.description)"')
+    labels=(${(f)"$(_call_program labels ${(q)cmd} 2>/dev/null)"})
+
+    (( $#labels )) || return 1
+    _describe -t labels 'label' labels
+}
+
+_implement-github-issues_issues() {
+    local -a issues cmd
+
+    _implement-github-issues_in_repo || return 1
+    cmd=(gh issue list --state open --limit 100 --json number,title
+         --jq '.[] | "\(.number):\(.title)"')
+    issues=(${(f)"$(_call_program issues ${(q)cmd} 2>/dev/null)"})
+
+    (( $#issues )) || return 1
+    _describe -t issues 'open issue' issues
+}
+
+# A new session name is just as valid; existing ones are offered because
+# launching more issues into one is the common case.
+_implement-github-issues_sessions() {
+    local -a sessions expl cmd
+
+    (( $+commands[tmux] )) || return 1
+    cmd=(tmux list-sessions -F '#{session_name}')
+    sessions=(${(f)"$(_call_program sessions ${(q)cmd} 2>/dev/null)"})
+
+    (( $#sessions )) || return 1
+    _wanted sessions expl 'tmux session' compadd -a sessions
+}
+
+_implement-github-issues() {
+    _arguments -s -S \
+        '(-h --help)'{-h,--help}'[show help]' \
+        '*'{-l,--label}'[select open issues carrying LABEL]:label:_implement-github-issues_labels' \
+        '(-L --limit)'{-L,--limit}'[maximum issues returned by the label query]:number' \
+        '--attach[attach or switch to the target session after launching]' \
+        '--dry-run[show what would be launched without changing tmux]' \
+        '1:tmux session:_implement-github-issues_sessions' \
+        '*:issue number:_implement-github-issues_issues'
+}
+
+_implement-github-issues "$@"

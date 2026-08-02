@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# bash completion for implement-github-issues. Works with Bash 3.2+, so the
+# classic COMPREPLY=( $(compgen ...) ) form is used rather than mapfile.
+#
+# Installed as ~/.local/share/bash-completion/completions/implement-github-issues
+# by "make install"; it can also simply be sourced from ~/.bashrc.
+
+# Labels and issues can only be queried from inside the checkout the command
+# itself expects to be run in.
+_ighi_in_repo() {
+    command -v gh >/dev/null 2>&1 \
+        && git rev-parse --git-dir >/dev/null 2>&1
+}
+
+_ighi_labels() {
+    _ighi_in_repo || return 0
+    gh label list --limit 100 --json name --jq '.[].name' 2>/dev/null
+}
+
+_ighi_issues() {
+    _ighi_in_repo || return 0
+    gh issue list --state open --limit 100 --json number --jq '.[].number' \
+        2>/dev/null
+}
+
+_ighi_sessions() {
+    command -v tmux >/dev/null 2>&1 || return 0
+    tmux list-sessions -F '#{session_name}' 2>/dev/null
+}
+
+# Which positional argument is being completed: 1 is the tmux session name,
+# 2 and up are issue numbers. Option values are skipped so that the word after
+# "--label security" still counts as the first positional.
+_ighi_positional_index() {
+    local index=1 i word end_of_options=false
+
+    for (( i = 1; i < COMP_CWORD; i++ )); do
+        word="${COMP_WORDS[$i]}"
+
+        if [[ "$end_of_options" == true ]]; then
+            index=$((index + 1))
+            continue
+        fi
+
+        case "$word" in
+            --)            end_of_options=true ;;
+            -l|--label|-L|--limit) i=$((i + 1)) ;;
+            -*)            ;;
+            *)             index=$((index + 1)) ;;
+        esac
+    done
+
+    printf '%d' "$index"
+}
+
+# Labels and tmux session names may contain spaces, so candidate lists are
+# split on newlines only. compgen -W also performs quote removal on its word
+# list, which is why the matches are quoted afterwards: without that, readline
+# would insert "good first issue" as three separate arguments.
+_ighi_complete() {
+    local candidates="$1" cur="$2" i
+    local IFS=$'\n'
+
+    # What is already on the line comes back escaped; match the plain text.
+    cur="${cur//\\/}"
+    COMPREPLY=( $(compgen -W "$candidates" -- "$cur") )
+    for i in "${!COMPREPLY[@]}"; do
+        COMPREPLY[$i]="$(printf '%q' "${COMPREPLY[$i]}")"
+    done
+}
+
+_implement_github_issues() {
+    local cur prev options
+
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD - 1]}"
+    COMPREPLY=()
+
+    case "$prev" in
+        -l|--label)
+            _ighi_complete "$(_ighi_labels)" "$cur"
+            return
+            ;;
+        -L|--limit)
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        options=$'-l\n--label\n-L\n--limit\n--attach\n--dry-run\n-h\n--help'
+        _ighi_complete "$options" "$cur"
+        return
+    fi
+
+    if [[ "$(_ighi_positional_index)" == 1 ]]; then
+        # A new session name is just as valid; existing ones are offered
+        # because launching more issues into one is the common case.
+        _ighi_complete "$(_ighi_sessions)" "$cur"
+    else
+        _ighi_complete "$(_ighi_issues)" "$cur"
+    fi
+}
+
+complete -F _implement_github_issues implement-github-issues
