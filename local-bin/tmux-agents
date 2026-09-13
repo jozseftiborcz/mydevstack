@@ -76,11 +76,23 @@ Usage:
   tmux-agents NUMBER        Attach to the agent shown with that number.
   tmux-agents next          Attach to the first agent waiting for input.
   tmux-agents new [NAME]    Create a tmux session and attach to it.
+  tmux-agents new claude [NAME]
+                            Create a session whose window is split
+                            side by side: a shell on the left and Claude
+                            Code running on the right, with the focus on
+                            Claude.
   tmux-agents help          Show this help (also -h or --help).
 
 "new" starts the session in the current directory, naming it after that
 directory unless NAME is given. Inside tmux the client switches to the new
-session instead of nesting a second one.
+session instead of nesting a second one. "new claude" starts Claude in the
+right pane through the pane's shell, so the pane stays open as a normal
+terminal once Claude exits.
+
+"help", "-h" and "--help" show this text wherever they appear, so
+"tmux-agents new --help" explains "new" rather than creating a session
+called "--help". A session cannot be named "claude", "help", "-h" or
+"--help" through this command.
 
 States come from the claude-tmux-state hook:
   INPUT       Claude is waiting for you (question, plan, or permission).
@@ -99,6 +111,8 @@ Examples:
   tmux-agents 2
   tmux-agents next
   tmux-agents new review-pr
+  tmux-agents new claude
+  tmux-agents new claude review-pr
 EOF
 }
 
@@ -301,8 +315,27 @@ attach_or_switch() {
     fi
 }
 
+# Split the session's window side by side and start Claude in the new right
+# pane. The command goes through the pane's shell rather than replacing it, so
+# the pane survives Claude exiting and turns back into a terminal. The pane is
+# selected explicitly, right before the client attaches, so that the focus
+# lands on Claude regardless of what happened in between.
+start_claude_pane() {
+    local session_id="$1" pane_id
+
+    command -v claude >/dev/null 2>&1 \
+        || die "claude is not installed; 'new claude' needs it on PATH."
+
+    pane_id="$(tmux split-window -h -t "$session_id" -c "$PWD" \
+        -P -F '#{pane_id}')" \
+        || die "Could not split the window for Claude."
+
+    tmux send-keys -t "$pane_id" 'claude' C-m
+    tmux select-pane -t "$pane_id"
+}
+
 create_session() {
-    local name="${1:-}" session_id
+    local with_claude="${1:-}" name="${2:-}" session_id
     local -a new_args=(new-session -d -c "$PWD")
 
     [[ -n "$name" ]] || name="$(default_session_name)"
@@ -320,6 +353,8 @@ create_session() {
     # only usable handle when tmux chose the name itself.
     session_id="$(tmux "${new_args[@]}" -P -F '#{session_id}')" \
         || die "Could not create the tmux session."
+
+    [[ -n "$with_claude" ]] && start_claude_pane "$session_id"
 
     attach_or_switch "$session_id"
 }
@@ -383,6 +418,17 @@ attach_next_waiting() {
     exit 1
 }
 
+# "new claude [NAME]" splits the window for Claude; "new [NAME]" does not.
+# Nothing else is accepted after "new".
+new_session_command() {
+    case "${1:-}" in
+        claude) (( $# <= 2 )) || { usage >&2; exit 2; }
+                create_session claude "${2:-}" ;;
+        *)      (( $# <= 1 )) || { usage >&2; exit 2; }
+                create_session "" "${1:-}" ;;
+    esac
+}
+
 main() {
     case "${1:-list}" in
         list)
@@ -394,15 +440,24 @@ main() {
             ;;
         -l|--long)      list_agents_long ;;
         next)           attach_next_waiting ;;
-        new)            create_session "${2:-}" ;;
-        -h|--help|help) usage ;;
+        new)            shift; new_session_command "$@" ;;
         *)              attach_agent "$1" ;;
     esac
 }
 
-# Only "list" and "new" take a second argument.
+# A help flag anywhere on the command line asks for help; it is never a
+# session name or an agent number. Checked before anything else runs so that
+# "new --help" cannot create a session.
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help|help) usage; exit 0 ;;
+    esac
+done
+
+# Only "list" and "new" take further arguments; "new" checks its own count.
 case "${1:-list}" in
-    list|new) (( $# <= 2 )) || { usage >&2; exit 2; } ;;
-    *)        (( $# <= 1 )) || { usage >&2; exit 2; } ;;
+    list) (( $# <= 2 )) || { usage >&2; exit 2; } ;;
+    new)  ;;
+    *)    (( $# <= 1 )) || { usage >&2; exit 2; } ;;
 esac
 main "$@"

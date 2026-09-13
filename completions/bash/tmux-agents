@@ -23,6 +23,19 @@ _tmux_agents_default_session() {
     printf '%s' "${name//[:.]/-}"
 }
 
+# Session name candidates for "new": the directory name plus any extra
+# keywords. The directory name may contain spaces, so it is kept as one
+# candidate and quoted for readline.
+_tmux_agents_session_names() {
+    local cur="$1" extra="${2:-}"
+    local IFS=$'\n' name
+
+    name="$(_tmux_agents_default_session)"
+    COMPREPLY=( $(compgen -W "$name${extra:+$'\n'$extra}" -- "${cur//\\/}") )
+    [[ -n "${COMPREPLY[0]:-}" ]] \
+        && COMPREPLY[0]="$(printf '%q' "${COMPREPLY[0]}")"
+}
+
 _tmux_agents() {
     local cur prev candidates
 
@@ -44,15 +57,15 @@ _tmux_agents() {
                     COMPREPLY=( $(compgen -W "-l --long" -- "$cur") )
                     ;;
                 new)
-                    # The directory name may contain spaces, so keep it as one
-                    # candidate and quote it for readline.
-                    local IFS=$'\n' name
-                    name="$(_tmux_agents_default_session)"
-                    COMPREPLY=( $(compgen -W "$name" -- "${cur//\\/}") )
-                    [[ -n "${COMPREPLY[0]:-}" ]] \
-                        && COMPREPLY[0]="$(printf '%q' "${COMPREPLY[0]}")"
+                    _tmux_agents_session_names "$cur" claude
                     ;;
             esac
+            ;;
+        3)
+            # "new claude NAME": the session name moves one word right.
+            if [[ "${COMP_WORDS[1]}" == new && "$prev" == claude ]]; then
+                _tmux_agents_session_names "$cur"
+            fi
             ;;
     esac
 }

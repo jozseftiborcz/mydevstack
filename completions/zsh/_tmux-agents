@@ -23,8 +23,17 @@ _tmux-agents_numbers() {
     _describe -t agents 'agent' agents
 }
 
+# tmux rejects ":" and "." in session names, so the script folds them before
+# falling back to the directory name.
+_tmux-agents_session_name() {
+    local name=${PWD:t}
+
+    name=${name//:/-}
+    name=${name//./-}
+    [[ -n $name ]] && _wanted names expl 'session name' compadd -- $name
+}
+
 _tmux-agents() {
-    local name
     local -a commands options long_options
 
     commands=(
@@ -53,21 +62,20 @@ _tmux-agents() {
         return
     fi
 
-    # Only "list" and "new" take a second argument.
+    # Only "list" and "new" take further arguments.
     if (( CURRENT == 3 )); then
         case ${words[2]} in
             list)
                 _describe -t options 'option' long_options
                 ;;
             new)
-                # tmux rejects ":" and "." in session names, so the script
-                # folds them before falling back to the directory name.
-                name=${PWD:t}
-                name=${name//:/-}
-                name=${name//./-}
-                [[ -n $name ]] && _wanted names expl 'session name' compadd -- $name
+                _describe -t modes 'mode' \
+                    '(claude:"split the window and start Claude on the right")'
+                _tmux-agents_session_name
                 ;;
         esac
+    elif (( CURRENT == 4 )) && [[ ${words[2]} == new && ${words[3]} == claude ]]; then
+        _tmux-agents_session_name
     fi
 }
 
