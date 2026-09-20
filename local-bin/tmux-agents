@@ -99,7 +99,7 @@ States come from the claude-tmux-state hook:
   ERROR       Claude stopped because of an error.
   IDLE        Turn finished or session ready.
   BACKGROUND  Turn ended with background tasks still running.
-  RUNNING     Claude is working.
+  RUNNING     Claude or one of its subagents is working.
   OFFLINE     The Claude session ended.
 
 Agents that need a human are listed first, so the lowest numbers are the

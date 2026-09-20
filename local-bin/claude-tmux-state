@@ -40,8 +40,12 @@ split_fields() {
     fields+=("$remainder")
 }
 
+# The current state, who produced it, and the remembered subagent list ride
+# along in the same call. display-message resolves @agent_* through pane ->
+# window -> session inheritance, so this works whichever scope the hook
+# writes at.
 pane_info="$(tmux display-message -p -t "$pane_id" \
-    "#{window_id}${DELIM}#{window_name}${DELIM}#{session_id}${DELIM}#{session_name}" \
+    "#{window_id}${DELIM}#{window_name}${DELIM}#{session_id}${DELIM}#{session_name}${DELIM}#{@agent_state}${DELIM}#{@agent_state_agent}${DELIM}#{@agent_subagents}" \
     2>/dev/null)" || exit 0
 
 split_fields "$pane_info"
@@ -49,7 +53,82 @@ window_id="${fields[0]:-}"
 window_name="${fields[1]:-}"
 session_id="${fields[2]:-}"
 session_name="${fields[3]:-}"
+current_state="${fields[4]:-}"
+current_state_agent="${fields[5]:-}"
+subagents="${fields[6]:-}"
 [[ -n "$window_id" && -n "$session_id" ]] || exit 0
+
+# Hooks fired inside a subagent carry agent_id (and agent_type); the main
+# thread's payloads have neither.
+agent_id="$(jq -r '.agent_id // ""' <<<"$payload")"
+agent_type="$(jq -r '.agent_type // ""' <<<"$payload")"
+from_subagent=0
+[[ -n "$agent_id" ]] && from_subagent=1
+
+# @agent_subagents remembers the subagents believed to be running as
+# space-separated "agent_id=agent_type" entries. Claude's idle notification
+# fires ~60s after the main turn ends even while subagents are still working,
+# and its payload carries no task information, so the hook has to keep this
+# list itself. Stop and SubagentStop rebuild it from the payload's
+# background_tasks, which also drops entries whose SubagentStop never fired
+# (a killed subagent).
+subagents_add() {
+    local entry="$1=${2:-agent}"
+    subagents_remove "$1"
+    subagents="${subagents:+$subagents }$entry"
+}
+
+subagents_remove() {
+    local entry kept=()
+    for entry in $subagents; do
+        [[ "${entry%%=*}" == "$1" ]] || kept+=("$entry")
+    done
+    subagents="${kept[*]:-}"
+}
+
+subagents_has() {
+    local entry
+    for entry in $subagents; do
+        [[ "${entry%%=*}" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+subagents_count() {
+    local -a entries=($subagents)
+    printf '%d' "${#entries[@]}"
+}
+
+subagents_types() {
+    local entry sep=""
+    for entry in $subagents; do
+        printf '%s%s' "$sep" "${entry#*=}"
+        sep=", "
+    done
+}
+
+# Rebuild the list from background_tasks. SubagentStop fires inside the
+# stopping subagent's own loop, so its task is still listed as running and
+# has to be excluded by id.
+subagents_from_tasks() {
+    local exclude="${1:-}"
+    subagents="$(jq -r --arg exclude "$exclude" '
+        [(.background_tasks // [])[]
+            | select((.type // "") == "subagent" and (.id // "") != $exclude)
+            | "\(.id)=\(.agent_type // "agent")"]
+        | join(" ")
+    ' <<<"$payload" 2>/dev/null | tr -d '\t\r\n')"
+}
+
+subagents_status() {
+    local verb="$1" count
+    count="$(subagents_count)"
+    if (( count == 1 )); then
+        printf '%s subagent: %s' "$verb" "$(subagents_types)"
+    else
+        printf '%s %d subagents: %s' "$verb" "$count" "$(subagents_types)"
+    fi
+}
 
 get_scope_option() {
     local level="$1" target="$2"
@@ -230,21 +309,22 @@ stop_status() {
 
 if [[ -n "$DEBUG_LOG" ]]; then
     mkdir -p "$(dirname "$DEBUG_LOG")" 2>/dev/null || true
-    printf '%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
         "$(jq -r '.hook_event_name // ""' <<<"$payload")" \
         "$(jq -r '.tool_name // .notification_type // ""' <<<"$payload")" \
-        "$session_name" "$pane_id" >>"$DEBUG_LOG" 2>/dev/null || true
+        "$session_name" "$pane_id" "$agent_id" >>"$DEBUG_LOG" 2>/dev/null || true
 fi
 
 event="$(jq -r '.hook_event_name // ""' <<<"$payload")"
 state="RUNNING"
 kind="activity"
 description="Claude is working"
+preserve_state=0
 
 case "$event" in
     SessionStart)
-        state="IDLE"; kind="ready"
+        state="IDLE"; kind="ready"; subagents=""
         [[ "$(jq -r '.source // "startup"' <<<"$payload")" == "resume" ]] \
             && description="Claude session resumed" \
             || description="Claude session ready"
@@ -338,8 +418,13 @@ case "$event" in
         case "$notification" in
             permission_prompt) exit 0 ;;
             idle_prompt)
-                state="IDLE"; kind="idle"
-                description="$(jq -r '.message // "Claude is waiting for the next prompt"' <<<"$payload")"
+                if (( $(subagents_count) > 0 )); then
+                    state="RUNNING"; kind="subagent"
+                    description="$(subagents_status "Waiting for")"
+                else
+                    state="IDLE"; kind="idle"
+                    description="$(jq -r '.message // "Claude is waiting for the next prompt"' <<<"$payload")"
+                fi
                 ;;
             elicitation_dialog|agent_needs_input)
                 state="INPUT"; kind="question"
@@ -358,11 +443,15 @@ case "$event" in
         ;;
 
     Stop)
+        subagents_from_tasks
         active="$(jq -r '
             ((.background_tasks // []) | map(select((.status // "") != "completed")) | length)
             + ((.session_crons // []) | length)
         ' <<<"$payload")"
-        if (( active > 0 )); then
+        if (( $(subagents_count) > 0 )); then
+            state="RUNNING"; kind="subagent"
+            description="$(subagents_status "Running")"
+        elif (( active > 0 )); then
             state="BACKGROUND"; kind="background"
             description="$(jq -r '
                 [(.background_tasks // [])[]
@@ -375,6 +464,29 @@ case "$event" in
         fi
         ;;
 
+    SubagentStart)
+        subagents_add "$agent_id" "$agent_type"
+        state="RUNNING"; kind="subagent"
+        description="Subagent started: ${agent_type:-agent}"
+        ;;
+
+    SubagentStop)
+        # Claude also runs internal helper agents after a turn ends (no
+        # SubagentStart, no agent_type). Their SubagentStop arrives after the
+        # main Stop and would turn IDLE back into RUNNING, so only a subagent
+        # that announced itself changes the state; the list is still rebuilt
+        # from background_tasks so it self-heals.
+        subagents_has "$agent_id" || preserve_state=1
+        subagents_from_tasks "$agent_id"
+        state="RUNNING"
+        if (( $(subagents_count) > 0 )); then
+            kind="subagent"; description="$(subagents_status "Running")"
+        else
+            kind="subagent-done"
+            description="Subagent ${agent_type:-agent} finished; Claude is continuing"
+        fi
+        ;;
+
     StopFailure)
         state="ERROR"; kind="error"
         description="$(jq -r '
@@ -384,14 +496,40 @@ case "$event" in
         ;;
 
     SessionEnd)
-        state="OFFLINE"; kind="offline"
+        state="OFFLINE"; kind="offline"; subagents=""
         description="Claude session ended: $(jq -r '.reason // "other"' <<<"$payload")"
         ;;
 
     *) exit 0 ;;
 esac
 
+# Tool events from inside a subagent keep their state but are labelled, so the
+# pane reads "Subagent Explore: Grep: foo" rather than looking like the main
+# thread. INPUT keeps its own kind so "tmux-agents next" still finds it.
+if (( from_subagent )); then
+    case "$event" in
+        SubagentStart|SubagentStop) ;;
+        *)
+            description="Subagent ${agent_type:-agent}: $description"
+            [[ "$state" == "RUNNING" ]] && kind="subagent"
+            ;;
+    esac
+
+    # Someone else waiting for the human must stay visible: another agent's
+    # tool calls only update the subagent list until that prompt is answered.
+    # The subagent that raised the prompt clears it itself on PostToolUse or
+    # PermissionDenied.
+    [[ "$current_state" == "INPUT" && "$state" != "INPUT" \
+        && "$current_state_agent" != "$agent_id" ]] && preserve_state=1
+fi
+
 description="$(clean "$description")"
+
+if (( preserve_state )); then
+    set_meta @agent_subagents "$subagents"
+    flush_meta
+    exit 0
+fi
 
 set_meta @agent_scope "$scope"
 set_meta @agent_session_name "$session_name"
@@ -402,8 +540,10 @@ set_meta @agent_pane_id "$pane_id"
 set_meta @agent_claude_session_id "$(jq -r '.session_id // ""' <<<"$payload")"
 set_meta @agent_prompt_id "$(jq -r '.prompt_id // ""' <<<"$payload")"
 set_meta @agent_state "$state"
+set_meta @agent_state_agent "$agent_id"
 set_meta @agent_status_kind "$kind"
 set_meta @agent_status_text "$description"
+set_meta @agent_subagents "$subagents"
 set_meta @agent_event "$event"
 set_meta @agent_updated "$(date +%s)"
 

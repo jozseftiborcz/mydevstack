@@ -61,14 +61,17 @@ Dependencies: `bash`, `tmux`, `jq`; `implement-github-issues` also needs
 A Claude Code hook that records what each Claude session is doing as tmux
 user options on the pane it runs in. `claude/settings.json` registers it for
 every lifecycle event (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, `PermissionRequest`, `Notification`, `Stop`, `SessionEnd`,
-...). Each fire writes, in a single tmux invocation:
+`PostToolUse`, `PermissionRequest`, `Notification`, `SubagentStart`,
+`SubagentStop`, `Stop`, `SessionEnd`, ...). Each fire writes, in a single
+tmux invocation:
 
 | Option                     | Content                                             |
 | -------------------------- | --------------------------------------------------- |
 | `@agent_state`             | `INPUT`, `ERROR`, `IDLE`, `BACKGROUND`, `RUNNING`, `OFFLINE` |
-| `@agent_status_kind`       | e.g. `question`, `approval`, `tool`, `result`, `error` |
+| `@agent_status_kind`       | e.g. `question`, `approval`, `tool`, `subagent`, `result`, `error` |
 | `@agent_status_text`       | one-line description (tool being run, question asked, ...) |
+| `@agent_subagents`         | subagents still running, as `agent_id=agent_type` entries |
+| `@agent_state_agent`       | `agent_id` of the subagent that produced the state, empty for the main thread |
 | `@agent_event`             | the hook event that produced the update             |
 | `@agent_updated`           | epoch seconds                                       |
 | `@agent_pane_id`, `@agent_window_*`, `@agent_session_*` | where the agent lives |
@@ -76,6 +79,19 @@ every lifecycle event (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
 
 These can be used directly in tmux formats (`#{@agent_state}`) for a status
 line or window list, and are what `tmux-agents` reads.
+
+Subagents started with the `Agent` tool run in the background, and their
+tool calls fire the same hooks with an `agent_id`. While any subagent is
+running the state stays `RUNNING` with kind `subagent` (`Subagent Explore:
+Grep: foo`, `Running 2 subagents: Explore, Plan`), including for the idle
+notification Claude sends a minute after the main turn ends, and a prompt
+waiting for the human (`INPUT`) is not overwritten by other agents' activity.
+`@agent_subagents` is rebuilt from `background_tasks` on every `Stop` and
+`SubagentStop`, so a subagent killed without a `SubagentStop` lingers only
+until the next turn ends. Claude also runs internal helper agents after a
+turn (no `SubagentStart`, no `agent_type`); their `SubagentStop` arrives
+after the main `Stop` and is ignored so it cannot turn `IDLE` back into
+`RUNNING`.
 
 Configuration (environment variables, read by the hook):
 
