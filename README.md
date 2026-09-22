@@ -61,9 +61,9 @@ Dependencies: `bash`, `tmux`, `jq`; `implement-github-issues` also needs
 A Claude Code hook that records what each Claude session is doing as tmux
 user options on the pane it runs in. `claude/settings.json` registers it for
 every lifecycle event (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, `PermissionRequest`, `Notification`, `SubagentStart`,
-`SubagentStop`, `Stop`, `SessionEnd`, ...). Each fire writes, in a single
-tmux invocation:
+`PostToolUse`, `PermissionRequest`, `Notification`, `MessageDisplay`,
+`SubagentStart`, `SubagentStop`, `Stop`, `SessionEnd`, ...). Each fire
+writes, in a single tmux invocation:
 
 | Option                     | Content                                             |
 | -------------------------- | --------------------------------------------------- |
@@ -92,6 +92,15 @@ until the next turn ends. Claude also runs internal helper agents after a
 turn (no `SubagentStart`, no `agent_type`); their `SubagentStop` arrives
 after the main `Stop` and is ignored so it cannot turn `IDLE` back into
 `RUNNING`.
+
+Claude also starts turns on its own: when a background task or subagent
+finishes, when a teammate sends a message, or on a `/loop` wakeup. These
+fire no `UserPromptSubmit`, so the first streamed line of the reply
+(`MessageDisplay`, index 0) is what moves the pane from `IDLE` to `RUNNING`;
+later flushes exit before touching tmux. For the same reason the
+`agent_completed` notification sets `RUNNING` rather than `IDLE`, and the
+idle notification leaves `BACKGROUND` alone while background work that
+`Stop` saw is still running.
 
 Configuration (environment variables, read by the hook):
 

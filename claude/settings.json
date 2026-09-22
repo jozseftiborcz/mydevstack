@@ -126,6 +126,16 @@
         ]
       }
     ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/claude-tmux-state"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
