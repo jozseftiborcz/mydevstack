@@ -94,13 +94,15 @@ after the main `Stop` and is ignored so it cannot turn `IDLE` back into
 `RUNNING`.
 
 Claude also starts turns on its own: when a background task or subagent
-finishes, when a teammate sends a message, or on a `/loop` wakeup. These
-fire no `UserPromptSubmit`, so the first streamed line of the reply
-(`MessageDisplay`, index 0) is what moves the pane from `IDLE` to `RUNNING`;
-later flushes exit before touching tmux. For the same reason the
-`agent_completed` notification sets `RUNNING` rather than `IDLE`, and the
-idle notification leaves `BACKGROUND` alone while background work that
-`Stop` saw is still running.
+finishes, when a teammate sends a message, or on a `/loop` wakeup. A
+finished background Bash task fires `UserPromptSubmit` (checked with Claude
+Code 2.1.280); the other triggers are unverified. As a fallback, the first
+streamed line of any reply (`MessageDisplay`, index 0) moves the pane to
+`RUNNING` unless the main thread already set it; later flushes exit before
+touching tmux. The `agent_completed` notification sets `RUNNING` rather
+than `IDLE`, since the main thread wakes up to handle the agent's result,
+and the idle notification leaves `BACKGROUND` alone while background work
+that `Stop` saw is still running.
 
 Configuration (environment variables, read by the hook):
 

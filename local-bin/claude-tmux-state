@@ -344,10 +344,10 @@ case "$event" in
         ;;
 
     MessageDisplay)
-        # Turns Claude starts on its own (a background task or subagent
-        # finished, a teammate wrote, a /loop wakeup) fire no
-        # UserPromptSubmit, so this is what moves them out of IDLE. A turn
-        # the main thread is already known to be running keeps its more
+        # Fallback for turns Claude starts on its own that fire no
+        # UserPromptSubmit (a finished background Bash task does fire it;
+        # teammate messages and /loop wakeups are unverified). A turn the
+        # main thread is already known to be running keeps its more
         # specific status.
         [[ "$current_state" == "RUNNING" && -z "$current_state_agent" && -z "$agent_id" ]] && exit 0
         state="RUNNING"; kind="responding"; description="Claude is responding"
